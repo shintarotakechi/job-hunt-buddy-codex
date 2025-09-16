@@ -1,547 +1,258 @@
-# REQUIREMENTS_v0.1 — Single-URL Job Canonicalizer (Personal, No Login, Google Later)
-Scope-narrowed, implementation-ready specification you can hand to an LLM/agent to build from scratch. The goal is to ingest ONE pasted job URL (e.g., Indeed), locate the canonical company career-page version of the same job, extract ONLY verified facts, and return:
-(1) a single-line, tab-delimited row matching your schema; (2) a vertical list of resume keywords.
-No email sending, no Google Sheets/Calendar yet. Zero hallucination rules apply.
-
-Stack (unchanged): Next.js 15 (frontend) · ASP.NET Web API (backend) · Playwright.NET (crawler) · Semantic Kernel (LLM) · Hangfire (optional later) · Cloudflare Workers + Wrangler (edge) · PostgreSQL (storage)
-
--------------------------------------------------------------------------------
-
-## 0) Non-Goals (for v0.1)
-- No multi-user features, no signup/login, no billing.
-- No bulk queue UI (internally allowed later), no emailing, no Google integrations.
-- Do not guess contacts/salary/level/mode; return `n/a` unless explicitly present on official/canonical pages.
-
--------------------------------------------------------------------------------
-
-## 1) Contracts — Input/Output & Field Rules
-
-1.1 Endpoint (backend)
-- Method: POST /extract
-- Request JSON:
-    {
-      "url": "https://…",               // REQUIRED. Public job URL
-      "htmlFallback": null,             // OPTIONAL. If page can’t be fetched, plain visible text/HTML pasted by operator
-      "timezone": "America/Los_Angeles" // OPTIONAL. Default America/Los_Angeles
-    }
-- Response JSON (success 200):
-    {
-      "rowTabDelimited": "<single-line-with-real-tabs>",  // 1 line; tabs between fields; no header
-      "keywordsBlock": "keywordA\nkeywordB\n...",         // 10–25 lines, \n separated
-      "auditId": "uuid",                                  // retrieve raw artifacts
-      "source": { "detected": "indeed|greenhouse|lever|workday|company|unknown", "canonicalUrl": "https://…|null" }
-    }
-- Response JSON (failure 4xx/5xx):
-    { "error": "MESSAGE", "code": "FETCH_FAILED|UNSUPPORTED|PARSE_FAILED|TIMEOUT|BAD_URL" }
-
-1.2 Excel Row Field Order (exact 20 fields)
-Return exactly 20 columns separated by REAL tab characters (U+0009). No `\t` literals. No embedded newlines. Use `n/a` when unknown.
-- companyName
-- jobTitle
-- jobSourceUrl                      // the original pasted URL
-- hiringManager                     // "Full Name — Title" only if explicit on official domain; else n/a
-- phone                              // +1-###-###-####, only if explicit; else n/a
-- email                              // RFC 5322, only if explicit; else n/a
-- stage                              // default "Seen"
-- nextActionDate                     // MM/DD/YYYY, today+7 in timezone
-- nextActionNote                     // default "Research company page & verify JD match"
-- lastUpdated                        // MM/DD/YYYY (date-only, Excel-friendly)
-- interviewDirection                 // markdown blob; v0.1 set n/a
-- interviewTags                      // e.g., {AI Demo, System Design}; else n/a
-- salaryRange                        // int4range "min–max" with integers; only if explicit $min–$max; else n/a
-- workMode                           // On-site | Hybrid | Remote; only if explicit; else n/a
-- jobLevel                           // e.g., Senior|Staff|L5; only if explicit; else n/a
-- applicationFiles                   // n/a for v0.1
-- version                            // "1"
-- createdAt                          // MM/DD/YYYY (date-only)
-- companyCareerUrl                   // discovered canonical JD URL or n/a  ← added to preserve provenance
-- dataConfidence                     // High|Medium|Low based on checks; v0.1 rules below
-
-1.3 Keywords Block
-- 10–25 lines, each a single keyword/phrase (no commas unless the phrase includes one).
-- Derived from the canonical JD (or aggregator if canonical not found). Do NOT invent technologies not present.
-
-1.4 Data Confidence (for provenance)
-- High: canonicalUrl is on company/ATS domain; title/company match; fields sourced from canonical.
-- Medium: canonicalUrl not found; aggregator fields are consistent and unambiguous.
-- Low: partial fields extracted; significant ambiguity or missing matches.
-
--------------------------------------------------------------------------------
-
-## 2) Monorepo Layout (paths and responsibilities)
-
-- /apps/frontend
-  - Next.js 15 app (App Router). Routes:
-    - / (URL form, results render, copy buttons)
-    - /audit/[id] (simple viewer for screenshot/HTML)
-- /apps/api
-  - ASP.NET Web API project with controllers/services
-  - Playwright bootstrap (singleton per process)
-  - Semantic Kernel client and prompt templates
-  - Data access (Npgsql)
-- /packages/domain
-  - DTOs: ExtractRequest/Response, ParsedFields, Confidence
-  - Value objects: Phone, Email, MoneyRange, DateOnlyUS
-  - State: not needed in v0.1 (keep for future)
-- /packages/extractors
-  - SourceDetector, HtmlNormalizer, SalaryParser, WorkModeClassifier, LevelClassifier
-  - Extractors: IndeedExtractor, AtsExtractorGeneric, JsonLdJobPostingParser
-  - CanonicalFinder: links traversal, ATS patterns
-- /packages/formatters
-  - ExcelRowFormatter, KeywordsFormatter, Sanitizers (strip newlines/tabs)
-- /packages/edge
-  - Cloudflare Workers handler (proxy /api/*, correlation, rate-limit)
-- /infra
-  - wrangler.toml templates, docker/docker-compose.local.yml, Makefile targets, runbooks
-- /docs
-  - This file, ERD.txt, Prompts.md, Test-fixtures.md
-
--------------------------------------------------------------------------------
-
-## 3) Environments & Secrets (names, examples, rules)
-
-All secrets via environment variables or Workers secrets. NEVER commit secrets.
-
-- API_ORIGIN=https://api.example.com
-- DB_CONN=Host=…;Port=5432;Database=jobs;Username=…;Password=…
-- PLAYWRIGHT_HEADLESS=true
-- PLAYWRIGHT_NAV_TIMEOUT_MS=30000
-- PLAYWRIGHT_POLITE_DELAY_MS=800..1600   // randomized window
-- USER_AGENT_OVERRIDE="Mozilla/5.0 …"
-- FETCH_MAX_REDIRECTS=5
-- TZ_DEFAULT=America/Los_Angeles
-- LLM_MODEL="gpt-*-reasoning|claude-*"   // Semantic Kernel bound
-- LLM_TEMPERATURE=0.1
-- LLM_MAX_TOKENS=1200
-- ROUTE_RATE_LIMIT=30/min
-- SCREENSHOT_DIR=/var/app/audit/png
-- HTML_DIR=/var/app/audit/html
-- FEATURE_USE_HANGFIRE=false
-
--------------------------------------------------------------------------------
-
-## 4) Cloudflare Workers (edge proxy) — Operational Spec
-
-Routes:
-- GET /api/health → proxy to API_ORIGIN
-- POST /api/extract → proxy to API_ORIGIN with timeout 35s
-
-Behavior:
-- Inject X-Request-Id (uuidv4) if absent; echo back in responses.
-- Rate-limit by IP: ROUTE_RATE_LIMIT.
-- Abort on > FETCH_MAX_REDIRECTS.
-- On 429/5xx from origin, pass through with same status.
-
-wrangler.toml (excerpt; use exact keys)
-    name = "job-canonizer"
-    main = "src/index.ts"
-    compatibility_date = "2025-09-16"
-    [vars]
-    API_ORIGIN = "https://api.example.com"
-
--------------------------------------------------------------------------------
-
-## 5) Backend — ASP.NET Web API (services, lifetimes, logging)
-
-Controllers:
-- ExtractController
-  - POST /extract (see contract §1)
-
-Services (DI, scoped unless noted):
-- IUrlNormalizer (stateless)
-- IPageFetcher (Playwright singleton; launches browser once; context-per-request)
-- ISourceDetector
-- IJobExtractor (strategy: picks proper extractor based on source)
-- ICanonicalFinder
-- IContactFinder
-- IJsonLdParser
-- ILlmClassifier (Semantic Kernel)
-- IExcelRowFormatter
-- IKeywordsFormatter
-- IAuditStore (persist HTML/PNG/JSON)
-- IClock (timezone-aware)
-- ILogger (structured logs with requestId)
-
-Timeouts:
-- Overall request budget: 25s default. If exceeded, return 504 FETCH_FAILED with hint "paste contents via htmlFallback".
-
--------------------------------------------------------------------------------
-
-## 6) Playwright.NET — Browser Policy
-
-Launch (singleton):
-- Headless: PLAYWRIGHT_HEADLESS
-- Chromium with:
-  - args: ["--disable-blink-features=AutomationControlled"]
-  - userAgent: USER_AGENT_OVERRIDE (if set)
-  - viewport: 1440x900
-- Navigation timeout: PLAYWRIGHT_NAV_TIMEOUT_MS (default 30s)
-
-Per request:
-- New browser context; persistent cookies off.
-- page.goto(url, waitUntil: "domcontentloaded")
-- waitForLoadState("networkidle") with cap 2.5s
-- Random polite delay: PLAYWRIGHT_POLITE_DELAY_MS uniform window
-- Save HTML innerText snapshot and outerHTML
-- Save PNG screenshot (fullPage) to SCREENSHOT_DIR
-
-Anti-bot guidance:
-- Do not solve captchas. If blocked, return PARSE_FAILED with advisory to use htmlFallback.
-
--------------------------------------------------------------------------------
-
-## 7) URL Normalization & Source Detection
-
-Normalization:
-- Remove utm_* and tracking params; keep path/query needed by ATS.
-- Collapse multiple slashes; strip trailing slash unless meaningful (e.g., Workday query).
-
-SourceDetector rules (host contains):
-- indeed.com → source=indeed
-- greenhouse.io / boards.greenhouse.io → source=greenhouse
-- lever.co / jobs.lever.co → source=lever
-- workdayjobs.com / myworkdayjobs.com → source=workday
-- else if company TLD and path includes "/careers", "/jobs/" → source=company
-- default → unknown (still attempt generic extraction)
-
--------------------------------------------------------------------------------
-
-## 8) Extraction — Field Heuristics (No-Guess)
-
-Primary data sources (in order of trust):
-1) JSON-LD schema.org JobPosting on page
-2) Visible DOM (labels near title/company/salary)
-3) Meta tags (`og:title`, `twitter:title`) if consistent with DOM
-
-8.1 JSON-LD JobPosting Parser
-- If script[type="application/ld+json"] includes JobPosting:
-  - title → jobTitle
-  - hiringOrganization.name → companyName
-  - jobLocationType: "TELECOMMUTE" → workMode=Remote
-  - jobLocation.address → city/state; ignore if not needed
-  - baseSalary.value.minValue/maxValue with currency "USD" → salaryRange
-- If any required field conflicts with visible H1/company label, prefer visible DOM.
-
-8.2 IndeedExtractor (selector candidates; robust to change)
-- Title candidates (pick longest non-empty text):
-  - h1[data-testid*="jobsearch-JobInfoHeader-title"]
-  - h1:has-text("job") near header
-- Company name candidates:
-  - div[data-company-name] a, div:has(span:has-text("Company")) a
-  - Link near title containing the company domain
-- Salary:
-  - Any text node containing "$" and "-" within job details panel; parse as annual if "year"/"yr"/"annual"
-- Work mode:
-  - Tokens: "Remote", "Hybrid", "On-site", "Onsite" (case-insensitive)
-- Level:
-  - Tokens: "Senior", "Staff", "Principal", "Lead", "L5", "L6", "IC", "Manager" (but avoid "Hiring Manager")
-- Description:
-  - main job content container; strip nav/ads
-
-8.3 Generic Company/ATS Extractor
-- Title:
-  - First H1 within main/section/article; fallback to `meta[property="og:title"]`
-- Company:
-  - If domain ≠ aggregator and contains company branding in header/footer; else take hiringOrganization from JSON-LD
-- Salary:
-  - Regex for $min–$max with optional commas; prefer annual; ignore hourly unless explicitly "hour"
-- Work mode:
-  - "Remote", "Hybrid", "On-site|Onsite"; if multiple present, choose the one in the summary header; else n/a
-- Level:
-  - Strict: accept only if token appears alongside title or in "About the role" heading
-
-8.4 Strict Contact Discovery (canonical domain only)
-- Only search pages on the canonicalUrl’s registrable domain (company or ATS).
-- On the JD page and at most 2 linked pages under same domain (Contact, Team, Recruiting):
-  - Hiring manager pattern: "(Hiring|Engineering|Product|Data) Manager|Director|Lead|Head of .*" adjacent to a person name (First Last)
-  - Recruiter pattern: "Recruiter|Talent Acquisition|TA" + person name
-  - Emails: mailto links or visible RFC 5322 emails; NO pattern guesses
-  - Phones: +1-###-###-####; normalize various US formats to that exact form
-- If not found, set hiringManager/email/phone to `n/a`.
-
--------------------------------------------------------------------------------
-
-## 9) Canonical Company JD Finder (Algorithm)
-
-Given initial page P0:
-1) If P0 domain is company/ATS → canonicalUrl = P0 (unless content indicates aggregator embed)
-2) Otherwise, attempt:
-   - Follow visible "Apply", "Apply on company site", "Careers", or company-domain anchor with rel* hints
-   - If target matches known ATS patterns (Greenhouse/Lever/Workday), accept
-   - If target is company domain and includes "job" or "careers" segments, accept
-3) If multiple candidates:
-   - Prefer ATS deep link with matching title string similarity ≥ 0.75 to P0 title
-   - Else prefer same-domain page with H1 containing all title tokens
-4) BFS depth ≤ 2; never leave the company registrable domain once entered
-5) If none found in budget, canonicalUrl = null
-
--------------------------------------------------------------------------------
-
-## 10) LLM (Semantic Kernel) — Prompts & Guardrails
-
-Model settings:
-- temperature=0.1, top_p=0.9, max_tokens=1200
-- JSON deterministic format; reject if keys missing
-
-Inputs:
-- visibleTitle, visibleCompany, visibleBody (plain text)
-- jsonld (if any), sourceType, canonicalUrl (if any)
-
-Tasks:
-A) Work mode classification
-  - Return "Remote"|"Hybrid"|"On-site" or "n/a" ONLY if an explicit literal is present in text. Quote the sentence snippet used for evidence.
-B) Job level classification
-  - Return a short token like "Senior","Staff","Principal","Lead","L5","Manager" or "n/a"; ONLY if explicit.
-C) Keywords extraction
-  - Return 10–25 high-signal terms present verbatim or as clear synonyms (e.g., "ASP.NET Core" ~ "ASP.NET"). Do not invent.
-
-Output JSON (example):
-    { "workMode":"Remote|Hybrid|On-site|n/a",
-      "jobLevel":"Senior|Staff|…|n/a",
-      "keywords":["...", "...", "..."],
-      "evidence":{"workMode":"<short quote>", "jobLevel":"<short quote>"} }
-
-If evidence is absent → set field to "n/a".
-
--------------------------------------------------------------------------------
-
-## 11) Formatting Rules — Excel Row & Keywords
-
-Sanitization (before composing):
-- Collapse internal whitespace to single spaces.
-- Remove tabs/newlines from every field (they break the single line).
-- Dates: format as MM/DD/YYYY in timezone.
-- Salary: "$168,000 – $240,000" → "168000–240000"
-- hiringManager: "First Last — Title" (em dash) if both are present; else `n/a`
-
-Composer (EXACT order from §1.2):
-- Join 20 fields with real tab chars (U+0009).
-- Never emit headers. Always emit 19 tabs (to ensure 20 columns).
-- Example (conceptual; not literal tabs here): company[TAB]title[TAB]url[…19 tabs total…]
-
-Keywords block:
-- Join array with '\n' (LF). No trailing newline at end.
-
--------------------------------------------------------------------------------
-
-## 12) Database Schema (PostgreSQL DDL)
-
-Tables (minimum viable, single-owner)
-
-    -- Raw page artifacts for audit
-    CREATE TABLE audit_artifact (
-      id UUID PRIMARY KEY,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      source_url TEXT NOT NULL,
-      canonical_url TEXT,
-      html_path TEXT NOT NULL,
-      screenshot_path TEXT NOT NULL,
-      detector TEXT NOT NULL
-    );
-
-    -- Parsed facts (normalized), one row per extract
-    CREATE TABLE extraction_result (
-      id UUID PRIMARY KEY,
-      artifact_id UUID NOT NULL REFERENCES audit_artifact(id) ON DELETE CASCADE,
-      company_name TEXT NOT NULL,
-      job_title TEXT NOT NULL,
-      job_source_url TEXT NOT NULL,
-      hiring_manager TEXT,
-      phone TEXT,
-      email TEXT,
-      stage TEXT NOT NULL, -- Seen|Applied|...
-      next_action_date DATE NOT NULL,
-      next_action_note TEXT NOT NULL,
-      last_updated DATE NOT NULL,
-      interview_direction TEXT,
-      interview_tags TEXT,
-      salary_range INT8RANGE, -- use int8 to be safe, or int4range if preferred
-      work_mode TEXT,
-      job_level TEXT,
-      application_files TEXT,
-      version INT NOT NULL,
-      created_at DATE NOT NULL,
-      company_career_url TEXT,
-      data_confidence TEXT NOT NULL  -- High|Medium|Low
-    );
-
-Indexes:
-- CREATE INDEX ON audit_artifact (created_at DESC);
-- CREATE INDEX ON extraction_result (company_name, job_title);
-- CREATE INDEX ON extraction_result USING GIST (salary_range);
-
--------------------------------------------------------------------------------
-
-## 13) Frontend — Next.js 15 UI Spec
-
-Screen: “Single URL Canonicalizer”
-- Components:
-  - URL input (required), timezone select (default America/Los_Angeles), submit button
-  - Result panel:
-    - Code-style box with single-line tab-delimited row
-    - Second box with vertical keywords
-    - Copy buttons (use Clipboard API)
-    - Audit link: /audit/{auditId}
-- Error states:
-  - If FETCH_FAILED → show “Paste visible contents” textarea; POST as htmlFallback
-  - If PARSE_FAILED → show inspector with screenshot/HTML links
-
-Accessibility:
-- Disable submit while in-flight; show progress; announce errors via ARIA live region.
-
--------------------------------------------------------------------------------
-
-## 14) Audit Viewer — /audit/[id]
-
-Displays:
-- Source URL, Canonical URL, Detector, CreatedAt
-- Screenshot image (fit to width)
-- Download/View raw HTML
-
-Security (personal mode):
-- No auth; hidden route (not indexed). Optionally require shared secret header when deployed publicly.
-
--------------------------------------------------------------------------------
-
-## 15) Error Handling & Edge Cases
-
-- Unsupported/blocked pages:
-  - Return FETCH_FAILED with guidance to paste htmlFallback
-- Multiple candidate canonicals:
-  - Choose highest title similarity; otherwise prefer ATS domain; else set canonicalUrl=null (Medium confidence)
-- Salary strings with hourly rates:
-  - If "hour" or "/hr" present → ignore (set n/a) for v0.1 to avoid mis-scaling
-- International currency:
-  - If not USD $ explicitly → set salaryRange n/a
-
--------------------------------------------------------------------------------
-
-## 16) Idempotency, Concurrency, Performance
-
-- Single-user, per-request idempotency via send-hash not required yet.
-- Limit to 1 browser context at a time initially; configurable later.
-- Enforce 25s request budget; advise fallback paste if exceeded.
-
--------------------------------------------------------------------------------
-
-## 17) Test Plan — Unit / Integration / E2E (concrete)
-
-Unit
-- UrlNormalizer: strips UTM, preserves ATS query
-- SalaryParser: "$168,000 – $240,000" → 168000–240000; hourly ignored
-- WorkModeClassifier: explicit literals only; ambiguous → n/a
-- LevelClassifier: "Senior", "Staff", "L5" detected only when explicit
-- Phone/Email normalizers: canonical forms, RFC 5322 compliance check
-
-Integration
-- IndeedExtractor on 3 recorded fixtures (stored HTML):
-  - Title/company populated; salary present only when explicit; work mode from header chips
-- JsonLd parser on 3 ATS fixtures (Greenhouse/Lever/Workday)
-- CanonicalFinder resolves from aggregator to ATS/company in ≥ 4/5 cases
-
-E2E
-- POST /extract with a valid Indeed URL:
-  - Produces a 20-field tab-delimited single line (verify exactly 19 tabs)
-  - nextActionDate = today+7 in TZ; lastUpdated/createdAt = today
-  - keywords 10–25 items; no invented tech
-- Blocked page path:
-  - Returns FETCH_FAILED; retry with htmlFallback produces valid outputs
-
-Manual checklist
-- Paste 5 diverse URLs (aggregator and ATS)
-- Copy row to Excel: each field lands in correct column; no wrap
-- Open audit viewer: screenshot and HTML match extracted values
-
--------------------------------------------------------------------------------
-
-## 18) Implementation Cards (buildable mini-scopes)
-
-[API-001] Wire POST /extract
-- Build: Controller, model validation, correlationId propagation
-- Test: 400 BAD_URL on malformed URL; 200 baseline
-
-[CRAWL-001] Playwright bootstrap
-- Build: Singleton browser; per-request context; HTML/PNG save
-- Test: Known page fetch; files exist
-
-[DETECT-001] SourceDetector
-- Build: hostname/regex mapping (indeed|greenhouse|lever|workday|company)
-- Test: Table-driven tests
-
-[PARSE-001] JsonLdJobPostingParser
-- Build: schema.org JobPosting parse with safe fallbacks
-- Test: Fixtures cover title/company/salary
-
-[PARSE-002] IndeedExtractor
-- Build: Title/company/salary/mode/level via resilient selector candidates
-- Test: 3 fixtures pass; where absent → n/a
-
-[CANON-001] CanonicalFinder
-- Build: Follow "Apply"/"Careers" anchors; ATS patterns; title similarity
-- Test: 5 cases; ≥4 resolved
-
-[CONTACT-001] ContactFinder (strict)
-- Build: Same-domain search; name+title; mailto; +1 phone normalization
-- Test: Positive/negative fixtures
-
-[LLM-001] SK Classifier
-- Build: Prompts+schema; temp=0.1; evidence gates
-- Test: Ambiguity → n/a; explicit → correct
-
-[FORMAT-001] Row/Keywords Composer
-- Build: Sanitizers; 20-field join; keywords join
-- Test: Excel paste sanity (19 tabs)
-
-[UI-001] Minimal UI
-- Build: Form; results; copy buttons; audit link
-- Test: 3 URL runs
-
-[AUDIT-001] Audit Viewer
-- Build: GET /audit/{id}; show html/screenshot
-- Test: Visual check
-
--------------------------------------------------------------------------------
-
-## 19) Runbook — Local Dev & Deploy
-
-Local
-- Prereqs: Node 20+, .NET 8+, PostgreSQL 14+, pnpm, Playwright browsers installed
-- Steps:
-  1) Create DB and set DB_CONN
-  2) Install Playwright deps: run playwright install
-  3) Start API: dotnet run -p apps/api
-  4) Start FE: pnpm dev --filter @apps/frontend
-  5) Optional Workers: wrangler dev (proxy to API_ORIGIN)
-
-Staging Deploy
-- Set API_ORIGIN in Workers vars
-- Publish Workers: wrangler deploy
-- Publish API (container or VM)
-- Verify /api/health, then /extract
-
--------------------------------------------------------------------------------
-
-## 20) Acceptance (Definition of Done)
-
-- From a clean deploy, pasting a valid Indeed URL returns:
-  - Single-line row (20 columns, unknowns as `n/a`, dates MM/DD/YYYY with nextActionDate=today+7)
-  - Keywords block (10–25 lines)
-  - auditId resolvable; screenshot/HTML align with extracted values
-- No invented data. Salary only when explicit $min–$max. Contacts only when explicitly present on official domain.
-- Canonical finder prefers company/ATS and overrides aggregator fields when found.
-
--------------------------------------------------------------------------------
-
-## 21) Roadmap (next increments, tiny)
-
-- Add Source B extractor (your most common ATS)
-- Add batch queue (Hangfire) for paste-many
-- Add CSV export of rows
-- Add Google adapters (Gmail/Sheets/Calendar) behind flags later
-
--------------------------------------------------------------------------------
-
-## 22) Operator UX Notes (Personal Mode)
-- If network blocks a page, use the “Paste visible contents” fallback. The system will parse the pasted HTML/text with the same rules and still return the two artifacts.
-- Always review the audit screenshot before trusting salary/contact fields.
+# REQUIREMENTS v0.1 — Single-URL Job Canonicalizer (Personal, No Login, Gemini-2.5-flash, Localhost-Testable)
+
+Purpose: When you paste an aggregator job URL (e.g., Indeed), the system must 1) read that exact HTML, 2) have the LLM extract core facts (company, title, salary, mode, level, etc.) strictly from the page, 3) locate the official company career site for that company, 4) find the same role on the company site (canonical JD), 5) re-extract/verify against the canonical page, then 6) output one Excel-ready single-line, tab-delimited row (20 columns) plus a vertical keyword list. No email/Sheets/Calendar yet. No guessing—values appear only if explicitly present.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+0) Scope and “Done”
+- In-scope: Single URL in, two artifacts out; aggregator → company canonicalization; strict evidence; audit trail of HTML and PNG; localhost operation.
+- Out-of-scope v0.1: Login, bulk queues UI, messaging/email, Google integrations.
+- Done when:
+  A) From a fresh localhost setup, POST /extract with a reachable Indeed URL returns:
+     • one single line with exactly 20 tab-separated fields, unknowns as n/a, dates MM/DD/YYYY with nextActionDate = today+7 (America/Los_Angeles by default)
+     • a vertical keyword list (10–25 items, each on its own line, no trailing line)
+     • source.detected and source.canonicalUrl populated; auditId opens screenshot and HTML
+  B) If a canonical company JD exists, canonical values override aggregator values.
+  C) Salary/contact/mode/level only appear if literally present; otherwise n/a.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+1) Localhost Topology, Stack, and Layout
+- Stack: Next.js 15 (FE), ASP.NET Web API (.NET 8) (BE), Playwright.NET (crawler), Gemini-2.5-flash (LLM via Gemini API), PostgreSQL (storage), Cloudflare Workers (dev proxy optional), Hangfire off.
+- Ports: API http://localhost:5050, FE http://localhost:3000, Workers proxy http://localhost:8787 → API, Postgres localhost:5432.
+- Monorepo layout:
+  • apps/frontend — minimal UI (URL input, results, audit link)
+  • apps/api — controllers/services, Playwright bootstrap, Gemini client, DB access
+  • packages/domain — DTOs, validation, confidence rules
+  • packages/extractors — AggregatorExtractor (Indeed v1), JsonLdParser, CanonicalFinder, CompanyExtractor (ATS/company), ContactFinder, TextSanitizers
+  • packages/formatters — RowComposer (20 fields), KeywordsComposer, DateFmt
+  • packages/edge — Workers proxy handler and config
+  • infra — env catalog, runbooks, migrations description
+  • docs — this spec, prompts schema, fixtures guide
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+2) Environment and Secrets (names only; no code snippets)
+- DB_CONN, TZ_DEFAULT=America/Los_Angeles, PLAYWRIGHT_HEADLESS=true, PLAYWRIGHT_NAV_TIMEOUT_MS=30000, PLAYWRIGHT_POLITE_DELAY_MS_MIN=800, PLAYWRIGHT_POLITE_DELAY_MS_MAX=1600, USER_AGENT_OVERRIDE, GEMINI_API_KEY, GEMINI_MODEL_ID=gemini-2.5-flash, FEATURE_USE_HANGFIRE=false, SCREENSHOT_DIR=./audit/png, HTML_DIR=./audit/html, API_ORIGIN=http://localhost:5050, ROUTE_RATE_LIMIT=30/min, FETCH_MAX_REDIRECTS=5, REQUEST_BUDGET_MS=25000.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+3) Data Contract (entities; no SQL)
+- AuditArtifact: id, createdAt, sourceUrl, canonicalUrl (nullable), htmlPath, screenshotPath, detector (free-text tag for logging; e.g., indeed/ats/company).
+- ExtractionResult: id, artifactId, companyName, jobTitle, jobSourceUrl, hiringManager, phone, email, stage, nextActionDate, nextActionNote, lastUpdated, interviewDirection, interviewTags, salaryRange (min–max int), workMode, jobLevel, applicationFiles, version, createdAt, companyCareerUrl, dataConfidence.
+- Note: salaryRange only when the page explicitly shows a USD range with a min and a max; otherwise n/a. workMode and jobLevel only when explicit tokens exist; otherwise n/a.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+4) Exact Outputs (format rules)
+- Excel row (20 fields, exact order; always emit 19 tabs):
+  1 companyName
+  2 jobTitle
+  3 jobSourceUrl
+  4 hiringManager (“FullName — Title” only if both explicit; else n/a)
+  5 phone (+1-###-###-#### only if explicit; else n/a)
+  6 email (RFC 5322 only if explicit; else n/a)
+  7 stage (default Seen)
+  8 nextActionDate (MM/DD/YYYY; today+7 in timezone)
+  9 nextActionNote (default “Research company page & verify JD match” unless the operator sets otherwise)
+  10 lastUpdated (MM/DD/YYYY; today)
+  11 interviewDirection (n/a v0.1)
+  12 interviewTags ({…} or n/a)
+  13 salaryRange (integer “min–max” only if explicit USD range on page; else n/a)
+  14 workMode (On-site | Hybrid | Remote only if explicit; else n/a)
+  15 jobLevel (Senior | Staff | Principal | Lead | L5 | Manager only if explicit; else n/a)
+  16 applicationFiles (n/a v0.1)
+  17 version (“1”)
+  18 createdAt (MM/DD/YYYY; today)
+  19 companyCareerUrl (canonical company/ATS JD URL if found; else n/a)
+  20 dataConfidence (High | Medium | Low per rules below)
+- Sanitization: remove tabs/newlines from every field; collapse multi-spaces; guarantee exactly 20 fields.
+- Keywords block: 10–25 items; one per line; derived from JD text only; no trailing newline; no invented tech.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+5) End-to-End Flow (this is the core correction to align with your intent)
+The system must behave like this when given, for example, https://www.indeed.com/viewjob?jk=05d232f064d525f1&tk=... :
+A. Read the aggregator HTML (Indeed) exactly as rendered (Playwright fetch). Save outer HTML and full-page PNG for audit.
+B. Feed the HTML (and visible text extracted) to the LLM (Gemini-2.5-flash) to extract: companyName, jobTitle, salary evidence (if any), explicit mode/level tokens, and JD body for keywords. Do not invent values; mark n/a if no literal evidence.
+C. With companyName from B, locate the official company domain (preferably from the page content; otherwise from known branding cues within the HTML). Examples: “Anduril Industries” → anduril.com. Record the chosen domain.
+D. Visit the company root domain. Discover the Careers area: try common paths (/careers, /jobs, /careers/jobs, /join, navigation link labeled “Careers”, “Jobs”, “Join Us”, “Open Roles”). Limit traversal to BFS depth 2 on the same registrable domain.
+E. Inside Careers or ATS pages under the company’s control (e.g., Greenhouse/Lever/Workday subpaths or subdomains linked from the company site), search for the exact role:
+   • Primary match on job title token similarity ≥ 0.75 compared to the aggregator title
+   • Secondary match on location tokens if present
+   • Tertiary hints: internal job ID, apply button presence, posting recency
+F. When an exact match is found, treat that page as the canonical JD (companyCareerUrl). Fetch HTML/PNG; re-extract using LLM (same no-guess rules); for conflicting fields, canonical overrides aggregator.
+G. Strict contacts discovery (canonical domain only): scan the canonical JD and up to two linked pages on the same domain (Contact/Team/Recruiting) for explicit person name + title, official recruiting email (mailto or visible RFC 5322), and US phone. Normalize phone to +1-###-###-####. If not explicit, set n/a.
+H. Compute nextActionDate = today+7 (timezone), lastUpdated and createdAt = today (MM/DD/YYYY).
+I. Decide dataConfidence:
+   • High when canonical found on company/ATS, title/company match, fields sourced from canonical
+   • Medium when canonical not found but aggregator extraction is consistent and unambiguous
+   • Low when ambiguities remain or page content insufficient
+J. Compose the 20-field single-line row with real tabs; compose keywords list; persist artifacts with auditId; return results.
+
+Important clarifications
+- The “source.detected” tag is only for logging/telemetry; the system always starts from the given aggregator page and then does the canonical hunt as described (your exact requirement).
+- LLM is the primary extractor from both the aggregator HTML and the canonical HTML; rule-based parsing is supportive (e.g., for salary digits, phone normalization), not authoritative.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+6) Gemini-2.5-flash Usage (what it must output; how to validate)
+- Input to LLM: visibleTitle string (if detectable), visibleCompany string, stripped visibleBody (from HTML), any JSON-LD content as text, and hints (e.g., “We are on the aggregator page” vs “We are on the company page”).
+- LLM must return JSON fields:
+  • companyName (string; only if explicitly stated; else n/a)
+  • jobTitle (string; literal JD title)
+  • workMode (Remote|Hybrid|On-site|n/a) with a short evidence quote when not n/a
+  • jobLevel (Senior|Staff|Principal|Lead|L5|Manager|n/a) with evidence when not n/a
+  • salary (raw textual snippet(s) that show explicit USD min–max; else empty)
+  • keywords (array of 10–25 terms; must appear in page text or are clear synonyms)
+- Client-side validation:
+  • If evidence is absent for workMode/jobLevel, set to n/a.
+  • Parse salary only if a USD range with min and max is detectable; convert to integers (strip $, commas); otherwise n/a.
+  • Remove tabs/newlines from all returned strings.
+- Time budget: The Gemini call must complete within 15s (overall budget 25s). If it cannot, short-circuit with FETCH_FAILED and request htmlFallback.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+7) Canonical Finder (what to build; how it decides)
+- Input: sourceUrl (aggregator), extracted companyName/title from LLM, initial page HTML.
+- Company domain discovery: prefer explicit links or domain mentions in the aggregator HTML; otherwise derive by brand string matching against link hosts on the page; if multiple candidates, prefer .com/.ai with the brand token.
+- Careers discovery on company domain: try direct paths (/careers, /jobs, /join), then page nav anchors (“Careers”, “Jobs”, “Join Us”, “Open Roles”); limit traversal to 2 clicks from root.
+- ATS handling: If careers link points to an ATS (Greenhouse/Lever/Workday) under company control (linked from company site), accept as canonical domain context.
+- Role match: use title token similarity (≥ 0.75 threshold). If several matches exist, prefer page with an “Apply” button and recent posting markers. If still tied, pick the one whose H1 equals or contains all major tokens from the aggregator title.
+- Failure mode: If no match within traversal budget, canonicalUrl = n/a and confidence cannot be High.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+8) Strict Contact Discovery (what counts; what not)
+- Allowed sources: only pages on the canonical registrable domain (the JD page plus up to two linked pages like Contact, Team, Recruiting).
+- Acceptable hiringManager: a person full name adjacent to a role title clearly relevant (e.g., “Director of Manufacturing Test”).
+- Acceptable email: explicit on page or mailto, RFC 5322; no pattern guesses.
+- Acceptable phone: US number normalized to +1-###-###-####; reject if non-standard or non-US in v0.1.
+- If any field is not clearly explicit, set n/a.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+9) API Contract and Error Modes (no code)
+- POST /extract with JSON body { url, htmlFallback?, timezone? }.
+- Successful 200 returns { rowTabDelimited, keywordsBlock, auditId, source: { detected, canonicalUrl } }.
+- Error returns { error, code } where code ∈ BAD_URL, FETCH_FAILED, UNSUPPORTED, PARSE_FAILED, TIMEOUT.
+- Guidance for FETCH_FAILED: Prompt user to paste visible page content into htmlFallback and retry, keeping the same rules.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+10) UI Requirements (frontend)
+- One page with a URL input, Submit, and two results boxes (copy for row; copy for keywords). A link “Open audit” points to /audit/{auditId}.
+- Error UX: If blocked or timed out, show a textarea to paste visible HTML/text and retry with htmlFallback.
+- Accessibility: Disable submit in flight; announce errors via ARIA live region; use monospace boxes for copy.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+11) Workers Dev Proxy (optional but recommended)
+- /api/* proxied to API_ORIGIN with X-Request-Id injection (uuid) and rate limiting using ROUTE_RATE_LIMIT.
+- Pass through 429/5xx; enforce FETCH_MAX_REDIRECTS.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+12) Testing — What to Build and How to Verify (no code)
+Unit (pure utility)
+- Salary normalization: “$168,000–$240,000” → 168000–240000; hourly or non-USD ignored (n/a).
+- Date formatting: given timezone and “today”, produce MM/DD/YYYY; nextActionDate = +7 days.
+- Sanitizers: remove tabs/newlines; guarantee 20 fields with 19 tabs.
+- Title similarity: token Jaccard or cosine; ensure ≥ 0.75 in positive cases; < 0.75 in negatives.
+
+Integration (fixtures; saved HTML)
+- Aggregator extraction: three Indeed fixtures (salary present, salary absent, explicit Remote) produce correct fields or n/a; LLM returns mode/level only with evidence lines.
+- Canonical discovery: aggregator fixture links lead to company careers/ATS fixture; canonicalUrl chosen; canonical overrides aggregator title/company; confidence = High.
+- Contacts: positive fixture (JD links to Recruiting page listing a named recruiter with title and email) populates all; negative fixture yields n/a.
+
+E2E (live or replayed through Playwright)
+- Paste a reachable Indeed URL:
+  • rowTabDelimited has exactly 20 fields; unknowns n/a; dates per MM/DD/YYYY; nextActionDate = today+7
+  • keywordsBlock 10–25 items; each on its own line; no inventions
+  • auditId opens screenshot and HTML that match the extracted values
+- Blocked page: returns FETCH_FAILED; on re-try with htmlFallback, outputs are produced without guessing.
+- No canonical found: confidence = Medium; companyCareerUrl = n/a.
+
+Operational checks
+- Time budget: long pages cause TIMEOUT; no partial guessing.
+- Proxy rate-limit can be triggered and returns a clear message.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+13) Implementation Cards (small, dependency-ordered; each contains “what to build” and “how to test”)
+ID API-001 — POST /extract scaffold
+- Build: Validate payload; start correlation ID; enforce REQUEST_BUDGET_MS.
+- Test: BAD_URL for malformed; 200 stub for valid.
+
+ID CRAWL-001 — Playwright bootstrap and capture
+- Build: Singleton browser; per-request context; UA override; save HTML to HTML_DIR and PNG to SCREENSHOT_DIR; create AuditArtifact with detector placeholder “source”.
+- Test: Known public page captured; files exist; artifact recorded.
+
+ID LLM-001 — Gemini client (JSON-style schema)
+- Build: Client that calls gemini-2.5-flash with responseMimeType application/json; returns companyName, jobTitle, workMode, jobLevel, salary raw snippets, keywords, evidence quotes; client-side validation and sanitization.
+- Test: Inject controlled HTML text; confirm explicit tokens get classified; no evidence → “n/a”; keywords 10–25.
+
+ID PARSE-AGG-001 — Aggregator extraction (LLM-first)
+- Build: From the fetched aggregator HTML, produce preliminary fields using LLM; also extract visible title/company text to feed into LLM; normalize salary only if explicit USD min-max.
+- Test: Three Indeed fixtures; values match page; no salary when not explicit.
+
+ID CANON-001 — Company domain locator
+- Build: From aggregator HTML + LLM companyName, identify the official domain (prefer links within the page; else brand token matching among link hosts).
+- Test: Given fixtures that contain company homepage links, resolve correct domain; ambiguous cases pick brand-matching .com/.ai.
+
+ID CANON-002 — Careers discovery on company domain
+- Build: Visit domain root; attempt /careers, /jobs, /join and nav anchors (“Careers”, “Jobs”, “Join Us”, “Open Roles”); BFS depth ≤ 2; remain on registrable domain or ATS linked from it.
+- Test: Company fixtures with a Careers nav item resolve to careers page; absence produces n/a with Medium confidence later.
+
+ID CANON-003 — Role match finder
+- Build: On careers/ATS pages, compute title token similarity to aggregator title; threshold ≥ 0.75; prefer pages with “Apply” buttons; choose best candidate.
+- Test: Positive fixtures select correct JD; negative fixtures yield no match.
+
+ID PARSE-CANON-001 — Canonical extraction (LLM-first)
+- Build: Fetch canonical page, capture artifacts, send to LLM; override aggregator fields where canonical provides explicit values.
+- Test: Fixture ensures canonical overrides aggregator for company/title; salary accepted only if explicit.
+
+ID CONTACT-001 — Strict contact discovery
+- Build: On canonical JD and up to two linked same-domain pages, search explicit name+title, recruiting email (mailto/visible), and US phone; normalize phone; else n/a.
+- Test: Positive and negative fixtures behave accordingly.
+
+ID CONF-001 — Confidence calculator
+- Build: Decide High/Medium/Low per Section 5.I; store companyCareerUrl accordingly.
+- Test: Canonical found → High; not found → Medium; conflicting signals → Low.
+
+ID FORMAT-001 — Row and keywords composition
+- Build: Compute dates; produce 20-field tab-delimited line with 19 tabs; ensure field sanitization; produce keyword list lines.
+- Test: Paste into Excel aligns columns; dates recognized; exact tab count verified.
+
+ID API-002 — Wire the pipeline
+- Build: A→I pipeline: fetch aggregator → LLM extract → company domain → careers → match → canonical fetch → LLM re-extract → contacts → confidence → compose → persist → respond.
+- Test: Full E2E on three URLs; artifacts and outputs match expectations.
+
+ID UI-001 — Minimal frontend
+- Build: URL input, submit, results boxes, copy buttons, audit link; fallback textarea on FETCH_FAILED.
+- Test: Manual run: copy-paste row to Excel; keywords list looks correct; audit opens.
+
+ID AUDIT-001 — Audit viewer route
+- Build: Display screenshot and link to raw HTML for auditId; show sourceUrl/canonicalUrl/detector/createdAt.
+- Test: Open recent audit; verify visuals match extracted values.
+
+ID SAFE-001 — Workers proxy and rate-limit
+- Build: Proxy /api/* to API_ORIGIN; inject X-Request-Id; apply ROUTE_RATE_LIMIT; enforce FETCH_MAX_REDIRECTS.
+- Test: Health via proxy; burst to trigger rate-limit; confirm error message.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+14) Operator Runbook (local)
+- Prereqs: Node 20+, .NET 8 SDK, PostgreSQL 14+, Playwright browsers installed, GEMINI_API_KEY.
+- Steps: Set env vars; start API at :5050; start FE at :3000; optional Workers at :8787.
+- Verify: Health 200; POST /extract with a reachable Indeed URL → get row+keywords and auditId; paste row into Excel; open audit viewer; confirm accuracy; try a blocked page then retry with htmlFallback.
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+15) Guardrails
+- Never guess contacts, salary, work mode, or level. Only populate when explicit on page; otherwise n/a.
+- Canonical page must come from the company’s registrable domain or ATS linked from that domain; do not “search the web” arbitrarily in v0.1.
+- LLM outputs must include short evidence quotes for workMode and jobLevel when not n/a; lack of evidence → n/a.
+- Salary must have both min and max in USD; otherwise n/a.
+- Always produce exactly 20 fields in the row; unknowns as n/a; dates in MM/DD/YYYY.
 
