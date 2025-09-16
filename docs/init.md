@@ -1,322 +1,547 @@
-# Requirements Definition — Personal Job Search Automation (Single-User, No Login, Google Integration Last)
-
-Stack: Next.js 15 (frontend) / ASP.NET Web API (backend) / Hangfire (jobs) / Playwright.NET (crawling) / Semantic Kernel (generation) / Cloudflare Workers + Wrangler (edge/proxy) / PostgreSQL (storage)  
-Monorepo: single GitHub repo hosting frontend + backend + shared packages
-
-This document is optimized for implementation by an LLM (small cards with clear scope). It focuses on **what to build**, **why**, **in what order**, and **how to validate**, without including code.
-
----
-
-## 0. Purpose & Scope (Personal Tool)
-- Goal: Continuously find fitting U.S. jobs, auto-generate tailored cover letters, send applications, track status, and schedule interviews—**for a single owner** (you), without any login or multi-tenant SaaS features.
-- Out of scope (initial): Public sign-up, billing, multi-user tenancy, admin roles, third-party data providers, mobile apps.
-- Privacy: Local-first mindset. Secrets are env-based; repo remains public but without secrets committed.
-
----
-
-## 1. Architecture (work without Google first; add Google last)
-- Edge: Cloudflare Workers
-  - Reverse proxy `/api/*` to ASP.NET origin; add rate-limits and request correlation IDs; serve SSR/static.
-- Frontend: Next.js 15 (App Router, RSC)
-  - Local “owner mode”: no login. A small “Config” panel writes preferences to backend (DB). Dashboard shows applications and statuses; buttons to retry/regenerate.
-- Backend: ASP.NET Web API (+ OpenAPI)
-  - Ports & Adapters for mail/sheets/calendar/auth so that we can start with **Local/Mock providers** and later swap in Google providers.
-- Jobs: Hangfire (PostgreSQL storage)
-  - Recurring and delayed jobs for crawl → score → generate → send → sync replies → update sheets/calendar.
-- Crawler: Playwright.NET
-  - Structured adapters per source (search URL builder, pagination, selectors, normalization, dedupe).
-- Storage: PostgreSQL
-  - Single-owner schema (no user table). Entities: Preferences, ResumeProfile, JobPosting, Application, EmailThread, SheetRow, CalendarEvent, CrawlLog, JobLog, FeatureFlags, SecretsMeta.
-- Providers (first = Local/Mock; last = Google):
-  - MailPort: LocalSMTP (send), IMAP (receive) → later Gmail.
-  - SheetPort: Local DB rows + CSV exporter → later Google Sheets.
-  - CalendarPort: ICS file generator → later Google Calendar.
-  - AuthPort: ‘none’ (no login) → later Google Sign-In if ever needed.
-
----
-
-## 2. Monorepo Layout (logical only)
-- `/apps/frontend` — Next.js 15
-- `/apps/api` — ASP.NET Web API + Hangfire server
-- `/packages/domain` — Domain models, validation, state machine
-- `/packages/ports` — Interfaces (MailPort, SheetPort, CalendarPort, AuthPort)
-- `/packages/adapters-local` — LocalSMTP, IMAP, CSVSheet, ICSCalendar
-- `/packages/adapters-google` — Gmail, Sheets, Calendar (added last)
-- `/packages/jobs` — Hangfire jobs (crawl/score/generate/send/sync)
-- `/packages/edge` — Workers handlers, Wrangler config
-- `/infra` — Runbooks, env and secrets naming, deploy notes
-- `/docs` — This requirements, ERD text, data contracts
-
----
-
-## 3. Domain Model (single owner)
-- Preference: job_categories[], location_radius, remote_allowed, keywords+, blacklist_keywords[], salary_floor, seniority_range.
-- ResumeProfile: extracted keywords/summary from your resume; multiple versions supported.
-- JobPosting: source, external_id, title, company, location, description_digest, url, fetched_at, dedupe_key.
-- Application: job_posting_id, fit_score, cover_letter_version, status (collected | generated | emailed | awaiting | interview | offer | rejected | closed), last_transition_at.
-- EmailThread: application_id, provider_thread_id (or msg IDs), labels[], last_snippet, last_synced_at.
-- SheetRow: application_id, row_key, fields(jsonb); CSV export record.
-- CalendarEvent: application_id, provider_event_id (or ics file path), when, status.
-- State machine: collected → generated → emailed → awaiting → interview/offer/rejected → closed. Events: generate_cover, send_email, reply_received, schedule_interview, outcome_offer, outcome_reject, timeout_followup.
-
----
-
-## 4. Phasing (Google last)
-- Phase 0: Infra and Ports (Local/Mock only).
-- Phase 1: Crawl → Score → Generate → Send (LocalSMTP) E2E.
-- Phase 2: Receive sync (IMAP), state updates, CSV export (SheetRow), ICS generation.
-- Phase 3: Observability, idempotency, error handling, rate control.
-- Phase 4: Optional Google adapters (Gmail/Sheets/Calendar) and feature flag switch.
-
----
-
-## 5. Global Config Flags (env; no secrets in repo)
-- FEATURE_GOOGLE: false → true (Phase 4).
-- MAIL_TX_PROVIDER: 'local_smtp' | 'gmail'.
-- MAIL_RX_PROVIDER: 'imap' | 'gmail'.
-- SHEET_PROVIDER: 'local_csv' | 'google'.
-- CAL_PROVIDER: 'ics' | 'google'.
-- AUTH_METHOD: 'none' (always none for personal mode).
-- SAFETY: rate limits, polite crawling delay, user-agent string, robots compliance policy toggle.
-
----
-
-## 6. Definition of Done (overall)
-- From clean deploy, with no login:
-  - Preferences set via UI → crawler fetches ≥3 jobs in 24h.
-  - Top matches: cover letters generated; at least one application sent via LocalSMTP.
-  - Dashboard reflects statuses; CSV file shows rows; ICS files open in a calendar client.
-  - On reply (IMAP), state transitions update; interview generates ICS.
-  - Failures retried; duplicates not sent; actions fully logged.
-
----
-
-## 7. Implementation Cards (tiny, ordered, each with validation and dependencies)
-
-[INF-001] Secrets & naming
-- Build: Env keys list (DB_CONN, API_ORIGIN, SMTP_HOST/PORT/USER/PASS, IMAP_HOST/USER/PASS, CSV_OUT_DIR, ICS_OUT_DIR, FEATURE_GOOGLE=false).
-- Test: Start API with dummy env; missing key yields clear error.
-- Depends: none.
-
-[INF-002] Environments & Wrangler
-- Build: `wrangler.toml` with dev/stg/prd sections; `API_ORIGIN` mapping; request ID middleware on Workers.
-- Test: `/api/health` via Workers returns 200 with correlation ID.
-- Depends: INF-001.
-
-[DB-001] Base schema (single-owner)
-- Build: Migrations for Preferences, ResumeProfile, JobPosting, Application, EmailThread, SheetRow, CalendarEvent, CrawlLog.
-- Test: Apply migrations; insert sample rows; constraints (unique dedupe_key) enforced.
-- Depends: none.
-
-[API-001] ASP.NET baseline + OpenAPI
-- Build: `/health`, `/version`, `/openapi.json`.
-- Test: 200 responses; schema browsable.
-- Depends: DB-001.
-
-[EDGE-001] Workers proxy to API
-- Build: Proxy `/api/*` to origin with timeout/backoff; add rate-limit per path.
-- Test: `/api/health` works through edge; rate-limit triggers at threshold.
-- Depends: API-001, INF-002.
-
-[FE-001] Next.js 15 baseline (no auth)
-- Build: SSR page with “Config” and “Dashboard” routes; call API for mock data.
-- Test: Page renders server-side; mock data visible.
-- Depends: EDGE-001.
-
-[CFG-001] Preferences API + UI
-- Build: CRUD endpoints and simple form (categories, radius, remote, keywords, salary floor).
-- Test: Save, reload, and read back identical values.
-- Depends: FE-001, API-001, DB-001.
-
-[JOB-BASE] Hangfire setup
-- Build: Server, Dashboard (protected via shared secret header), queues, retry policy, DLQ concept.
-- Test: Enqueue dummy job; success, failure, retry paths visible in dashboard.
-- Depends: API-001, DB-001.
-
-[CRAWL-001] Playwright foundation
-- Build: Base crawler class (UA, polite delays, wait-for-selectors, timeout, snapshot).
-- Test: Fetch a known static page; log DOM capture and screenshot.
-- Depends: JOB-BASE.
-
-[CRAWL-002] Normalization & dedupe
-- Build: Mapping contract for a JobPosting; dedupe_key rules (source+external_id or URL hash).
-- Test: Insert duplicates; only one JobPosting persists.
-- Depends: DB-001, CRAWL-001.
-
-[CRAWL-003] Source A adapter
-- Build: Query builder, pagination, item extraction, normalization, save to DB.
-- Test: With Preferences, collect ≥10 items; log success/fail rate; dedupe < 10%.
-- Depends: CRAWL-002.
-
-[CRAWL-004] Source B adapter
-- Build: Same as A for a second site.
-- Test: Combined unique count increases; overlap ratio measured.
-- Depends: CRAWL-002.
-
-[MATCH-001] Fit scoring v1
-- Build: Keyword match with weights (ResumeProfile × JobPosting); threshold + top-K selection.
-- Test: For a target role, top results look reasonable in manual spot-check.
-- Depends: DB-001, CRAWL-002.
-
-[RESUME-001] ResumeProfile extractor
-- Build: Upload endpoint (PDF/DOCX) → text extract → key skills summary stored.
-- Test: Known resume yields expected key phrases; re-upload updates summary.
-- Depends: API-001, DB-001.
-
-[GEN-001] Cover letter template (Semantic Kernel)
-- Build: Input contract (JobPosting + ResumeProfile + optional company signals) → output contract (sections, length, tone).
-- Test: 3 job types produce distinct, non-repetitive letters without hallucinated claims.
-- Depends: MATCH-001, RESUME-001.
-
-[MAIL-TX-LCL-001] Local SMTP sender (MailPort)
-- Build: Send email with subject, body, attachments (resume). Persist a send hash per application to ensure idempotency.
-- Test: Deliver to a test mailbox; verify headers/body; ensure repeated attempts do not duplicate (hash guard).
-- Depends: INF-001, GEN-001, STATE-001.
-
-[STATE-001] Application state machine
-- Build: Enforce legal transitions; hooks to call Ports on transitions (send, sheet update, calendar).
-- Test: Unit test every transition and block illegal ones.
-- Depends: DB-001.
-
-[SEND-001] Application send job
-- Build: Pull top-K matches above threshold; generate cover if missing; lock application; send via MailPort; transition to 'emailed'.
-- Test: Dry-run (no send) vs real send; in real send, status becomes 'emailed' once; logs contain correlation IDs.
-- Depends: GEN-001, MAIL-TX-LCL-001, STATE-001, JOB-BASE.
-
-[UI-DASH-001] Dashboard v1
-- Build: Table with Role, Company, FitScore, Status, LastUpdate, links to posting and email thread IDs.
-- Test: After SEND-001, rows appear and update on refresh.
-- Depends: FE-001, STATE-001.
-
-[SHEET-LCL-001] Local sheet adapter (DB rows)
-- Build: Upsert a 'SheetRow' per application; maintain a consistent column mapping.
-- Test: State change updates the row (idempotent upsert).
-- Depends: STATE-001, DB-001.
-
-[SHEET-CSV-001] CSV exporter
-- Build: Periodic job writes CSV snapshot to `CSV_OUT_DIR`; stable headers.
-- Test: Edit an application; next export reflects change; no duplicate rows.
-- Depends: SHEET-LCL-001, JOB-BASE.
-
-[CAL-ICS-001] ICS generator
-- Build: Create `.ics` files for interviews; include title, description, location/meeting link, reminders.
-- Test: Import ICS into a calendar client; time zone correct; update regenerates file.
-- Depends: STATE-001.
-
-[MAIL-RX-IMAP-001] IMAP puller (receive sync)
-- Build: Connect to inbox/folder; incremental fetch; basic intent detection (interview/offer/reject).
-- Test: Seed mailbox with sample replies; correct transitions to 'interview', 'offer', 'rejected'.
-- Depends: INF-001, STATE-001, DB-001.
-
-[AUTO-LOOP-001] Orchestrated loop
-- Build: Recurring jobs for crawl (A,B), scoring, generate, send, receive sync, sheet export, ics updates; concurrency guard (single-owner).
-- Test: 24-hour burn: logs show cycles; no unbounded retries; idempotency holds.
-- Depends: CRAWL-003/004, MATCH-001, GEN-001, SEND-001, MAIL-RX-IMAP-001, SHEET-CSV-001, CAL-ICS-001.
-
-[SAFE-IDEMP-001] Idempotency & duplicate prevention
-- Build: Business IDs and send-hashes; upsert semantics; lock per application when acting.
-- Test: Concurrent re-runs do not duplicate emails or rows; race tests pass.
-- Depends: SEND-001, SHEET-LCL-001.
-
-[OBS-001] Observability & alerts (local)
-- Build: Structured logs with correlation IDs; metrics for success rates, retries, 4xx/5xx; alert on high failure rate.
-- Test: Force failures; ensure alert triggers and quiets once recovered.
-- Depends: JOB-BASE.
-
-[UX-CFG-001] Config UX polish (personal mode)
-- Build: One-page config with live validation and helpful defaults; tooltips for crawl safety and email etiquette.
-- Test: Change config; next cycles obey new settings without restart.
-- Depends: CFG-001, FE-001.
-
-— Up to here: Phases 0–3 complete (no Google; real email via SMTP, real replies via IMAP, local CSV/ICS) —
-
-[GOOG-BOOT-001] Google Cloud project (optional last)
-- Build: Project + OAuth consent (test user only).
-- Test: Consent screen shows; authorization code returned.
-- Depends: none (for Google branch).
-
-[GOOG-MAIL-TX-001] Gmail sender adapter
-- Build: Draft→Send; thread_id capture; label strategy (Jobs/*).
-- Test: Real send; correct labels; thread tracking.
-- Depends: GOOG-BOOT-001, Ports.
-
-[GOOG-MAIL-RX-001] Gmail receive adapter
-- Build: Incremental sync; map threads to Applications; intent detection.
-- Test: Sample replies drive correct transitions.
-- Depends: GOOG-MAIL-TX-001, STATE-001.
-
-[GOOG-SHEET-001] Google Sheets adapter
-- Build: Column mapping; idempotent upsert; error handling on rate limits.
-- Test: Local SheetRow mirrors to Google; no duplicates.
-- Depends: GOOG-BOOT-001, Ports.
-
-[GOOG-CAL-001] Google Calendar adapter
-- Build: Event create/update; reminders; attendees optional.
-- Test: Events visible and editable in Google Calendar.
-- Depends: GOOG-BOOT-001, Ports.
-
-[MIG-001] Switch & migration
-- Build: Feature flags to move from local providers to Google; one-time sync (DB/CSV → Sheets; ICS → Calendar).
-- Test: Staging switch shows identical dashboard; no double-writes; backout plan validated.
-- Depends: All GOOG-*.
-
----
-
-## 8. E2E Scenarios (observable checkpoints)
-
-Scenario A: First run to first application (no Google)
-- Set preferences and upload resume.
-- Crawl collects ≥10 postings; top-K scored; letters generated; one email sent.
-- Dashboard shows 'emailed'; CSV contains row; logs show correlation IDs.
-
-Scenario B: Reply to interview (IMAP)
-- Place a reply email containing “interview”.
-- IMAP sync detects; Application → 'interview'; ICS generated.
-- Dashboard and CSV reflect change; ICS opens correctly.
-
-Scenario C: Timeout follow-up
-- After N days without reply, a follow-up template is resent once (configurable).
-- Status 'awaiting' persists; 'LastUpdate' changes; no duplicate threads.
-
-Scenario D: Failure & recovery
-- Cause SMTP failure; ensure retries; if exceeded, DLQ with manual retry button in UI.
-- Upon recovery, only one successful send event recorded.
-
-Scenario E (optional): Feature flag switch to Google
-- Flip providers in staging; run migration; verify equality of rows and events; then flip in prod.
-
----
-
-## 9. Non-Functional Requirements
-- Idempotency: All write operations safe on retry (send hashes, upserts, locks).
-- Safety: Crawl with politeness delays; respect robots and site TOS according to your policy; configurable.
-- Reliability: Automatic backoff; DLQ and manual replays.
-- Performance: Batching for CSV; bounded concurrency (single owner → 1–2 workers).
-- Security: Secrets only via env or Workers secrets; no PII beyond minimal metadata stored.
-- Time zone: America/Los_Angeles for all scheduling; DST-aware.
-
----
-
-## 10. Risk & Compliance Notes (personal use)
-- Crawling: Each site’s terms may restrict automation. Keep sources you personally use and configure rate limits; maintain a blocklist. Fail gracefully on anti-bot challenges.
-- Email reputation: Stagger sends, vary subjects, and include proper signatures to avoid spam flags.
-- Data loss: CSV/ICS outputs serve as human-readable backups; periodic DB dumps recommended.
-
----
-
-## 11. Deliverables (from a single GitHub repo)
-- Monorepo with the layout above.
-- Running system (dev/stg/prod) deployable via one command per environment.
-- No-login owner mode: config UI, dashboard, jobs.
-- Local providers fully working (SMTP/IMAP + CSV + ICS).
-- Optional Google adapters behind feature flags, plus migration script.
-- Runbooks: setup, rotate secrets, deploy, rollback, crawl-safety checklist.
-
----
-
-## 12. LLM Hand-off Guidance (for each card)
-- Use the card’s “Build” as the minimal PR scope and “Test” as acceptance checks.
-- Write/update a changelog entry per card; keep migrations reversible.
-- Add idempotency tests early (before wiring the job into cron flows).
-- Prefer configuration over code changes for behavior toggles (feature flags).
+# REQUIREMENTS_v0.1 — Single-URL Job Canonicalizer (Personal, No Login, Google Later)
+Scope-narrowed, implementation-ready specification you can hand to an LLM/agent to build from scratch. The goal is to ingest ONE pasted job URL (e.g., Indeed), locate the canonical company career-page version of the same job, extract ONLY verified facts, and return:
+(1) a single-line, tab-delimited row matching your schema; (2) a vertical list of resume keywords.
+No email sending, no Google Sheets/Calendar yet. Zero hallucination rules apply.
+
+Stack (unchanged): Next.js 15 (frontend) · ASP.NET Web API (backend) · Playwright.NET (crawler) · Semantic Kernel (LLM) · Hangfire (optional later) · Cloudflare Workers + Wrangler (edge) · PostgreSQL (storage)
+
+-------------------------------------------------------------------------------
+
+## 0) Non-Goals (for v0.1)
+- No multi-user features, no signup/login, no billing.
+- No bulk queue UI (internally allowed later), no emailing, no Google integrations.
+- Do not guess contacts/salary/level/mode; return `n/a` unless explicitly present on official/canonical pages.
+
+-------------------------------------------------------------------------------
+
+## 1) Contracts — Input/Output & Field Rules
+
+1.1 Endpoint (backend)
+- Method: POST /extract
+- Request JSON:
+    {
+      "url": "https://…",               // REQUIRED. Public job URL
+      "htmlFallback": null,             // OPTIONAL. If page can’t be fetched, plain visible text/HTML pasted by operator
+      "timezone": "America/Los_Angeles" // OPTIONAL. Default America/Los_Angeles
+    }
+- Response JSON (success 200):
+    {
+      "rowTabDelimited": "<single-line-with-real-tabs>",  // 1 line; tabs between fields; no header
+      "keywordsBlock": "keywordA\nkeywordB\n...",         // 10–25 lines, \n separated
+      "auditId": "uuid",                                  // retrieve raw artifacts
+      "source": { "detected": "indeed|greenhouse|lever|workday|company|unknown", "canonicalUrl": "https://…|null" }
+    }
+- Response JSON (failure 4xx/5xx):
+    { "error": "MESSAGE", "code": "FETCH_FAILED|UNSUPPORTED|PARSE_FAILED|TIMEOUT|BAD_URL" }
+
+1.2 Excel Row Field Order (exact 20 fields)
+Return exactly 20 columns separated by REAL tab characters (U+0009). No `\t` literals. No embedded newlines. Use `n/a` when unknown.
+- companyName
+- jobTitle
+- jobSourceUrl                      // the original pasted URL
+- hiringManager                     // "Full Name — Title" only if explicit on official domain; else n/a
+- phone                              // +1-###-###-####, only if explicit; else n/a
+- email                              // RFC 5322, only if explicit; else n/a
+- stage                              // default "Seen"
+- nextActionDate                     // MM/DD/YYYY, today+7 in timezone
+- nextActionNote                     // default "Research company page & verify JD match"
+- lastUpdated                        // MM/DD/YYYY (date-only, Excel-friendly)
+- interviewDirection                 // markdown blob; v0.1 set n/a
+- interviewTags                      // e.g., {AI Demo, System Design}; else n/a
+- salaryRange                        // int4range "min–max" with integers; only if explicit $min–$max; else n/a
+- workMode                           // On-site | Hybrid | Remote; only if explicit; else n/a
+- jobLevel                           // e.g., Senior|Staff|L5; only if explicit; else n/a
+- applicationFiles                   // n/a for v0.1
+- version                            // "1"
+- createdAt                          // MM/DD/YYYY (date-only)
+- companyCareerUrl                   // discovered canonical JD URL or n/a  ← added to preserve provenance
+- dataConfidence                     // High|Medium|Low based on checks; v0.1 rules below
+
+1.3 Keywords Block
+- 10–25 lines, each a single keyword/phrase (no commas unless the phrase includes one).
+- Derived from the canonical JD (or aggregator if canonical not found). Do NOT invent technologies not present.
+
+1.4 Data Confidence (for provenance)
+- High: canonicalUrl is on company/ATS domain; title/company match; fields sourced from canonical.
+- Medium: canonicalUrl not found; aggregator fields are consistent and unambiguous.
+- Low: partial fields extracted; significant ambiguity or missing matches.
+
+-------------------------------------------------------------------------------
+
+## 2) Monorepo Layout (paths and responsibilities)
+
+- /apps/frontend
+  - Next.js 15 app (App Router). Routes:
+    - / (URL form, results render, copy buttons)
+    - /audit/[id] (simple viewer for screenshot/HTML)
+- /apps/api
+  - ASP.NET Web API project with controllers/services
+  - Playwright bootstrap (singleton per process)
+  - Semantic Kernel client and prompt templates
+  - Data access (Npgsql)
+- /packages/domain
+  - DTOs: ExtractRequest/Response, ParsedFields, Confidence
+  - Value objects: Phone, Email, MoneyRange, DateOnlyUS
+  - State: not needed in v0.1 (keep for future)
+- /packages/extractors
+  - SourceDetector, HtmlNormalizer, SalaryParser, WorkModeClassifier, LevelClassifier
+  - Extractors: IndeedExtractor, AtsExtractorGeneric, JsonLdJobPostingParser
+  - CanonicalFinder: links traversal, ATS patterns
+- /packages/formatters
+  - ExcelRowFormatter, KeywordsFormatter, Sanitizers (strip newlines/tabs)
+- /packages/edge
+  - Cloudflare Workers handler (proxy /api/*, correlation, rate-limit)
+- /infra
+  - wrangler.toml templates, docker/docker-compose.local.yml, Makefile targets, runbooks
+- /docs
+  - This file, ERD.txt, Prompts.md, Test-fixtures.md
+
+-------------------------------------------------------------------------------
+
+## 3) Environments & Secrets (names, examples, rules)
+
+All secrets via environment variables or Workers secrets. NEVER commit secrets.
+
+- API_ORIGIN=https://api.example.com
+- DB_CONN=Host=…;Port=5432;Database=jobs;Username=…;Password=…
+- PLAYWRIGHT_HEADLESS=true
+- PLAYWRIGHT_NAV_TIMEOUT_MS=30000
+- PLAYWRIGHT_POLITE_DELAY_MS=800..1600   // randomized window
+- USER_AGENT_OVERRIDE="Mozilla/5.0 …"
+- FETCH_MAX_REDIRECTS=5
+- TZ_DEFAULT=America/Los_Angeles
+- LLM_MODEL="gpt-*-reasoning|claude-*"   // Semantic Kernel bound
+- LLM_TEMPERATURE=0.1
+- LLM_MAX_TOKENS=1200
+- ROUTE_RATE_LIMIT=30/min
+- SCREENSHOT_DIR=/var/app/audit/png
+- HTML_DIR=/var/app/audit/html
+- FEATURE_USE_HANGFIRE=false
+
+-------------------------------------------------------------------------------
+
+## 4) Cloudflare Workers (edge proxy) — Operational Spec
+
+Routes:
+- GET /api/health → proxy to API_ORIGIN
+- POST /api/extract → proxy to API_ORIGIN with timeout 35s
+
+Behavior:
+- Inject X-Request-Id (uuidv4) if absent; echo back in responses.
+- Rate-limit by IP: ROUTE_RATE_LIMIT.
+- Abort on > FETCH_MAX_REDIRECTS.
+- On 429/5xx from origin, pass through with same status.
+
+wrangler.toml (excerpt; use exact keys)
+    name = "job-canonizer"
+    main = "src/index.ts"
+    compatibility_date = "2025-09-16"
+    [vars]
+    API_ORIGIN = "https://api.example.com"
+
+-------------------------------------------------------------------------------
+
+## 5) Backend — ASP.NET Web API (services, lifetimes, logging)
+
+Controllers:
+- ExtractController
+  - POST /extract (see contract §1)
+
+Services (DI, scoped unless noted):
+- IUrlNormalizer (stateless)
+- IPageFetcher (Playwright singleton; launches browser once; context-per-request)
+- ISourceDetector
+- IJobExtractor (strategy: picks proper extractor based on source)
+- ICanonicalFinder
+- IContactFinder
+- IJsonLdParser
+- ILlmClassifier (Semantic Kernel)
+- IExcelRowFormatter
+- IKeywordsFormatter
+- IAuditStore (persist HTML/PNG/JSON)
+- IClock (timezone-aware)
+- ILogger (structured logs with requestId)
+
+Timeouts:
+- Overall request budget: 25s default. If exceeded, return 504 FETCH_FAILED with hint "paste contents via htmlFallback".
+
+-------------------------------------------------------------------------------
+
+## 6) Playwright.NET — Browser Policy
+
+Launch (singleton):
+- Headless: PLAYWRIGHT_HEADLESS
+- Chromium with:
+  - args: ["--disable-blink-features=AutomationControlled"]
+  - userAgent: USER_AGENT_OVERRIDE (if set)
+  - viewport: 1440x900
+- Navigation timeout: PLAYWRIGHT_NAV_TIMEOUT_MS (default 30s)
+
+Per request:
+- New browser context; persistent cookies off.
+- page.goto(url, waitUntil: "domcontentloaded")
+- waitForLoadState("networkidle") with cap 2.5s
+- Random polite delay: PLAYWRIGHT_POLITE_DELAY_MS uniform window
+- Save HTML innerText snapshot and outerHTML
+- Save PNG screenshot (fullPage) to SCREENSHOT_DIR
+
+Anti-bot guidance:
+- Do not solve captchas. If blocked, return PARSE_FAILED with advisory to use htmlFallback.
+
+-------------------------------------------------------------------------------
+
+## 7) URL Normalization & Source Detection
+
+Normalization:
+- Remove utm_* and tracking params; keep path/query needed by ATS.
+- Collapse multiple slashes; strip trailing slash unless meaningful (e.g., Workday query).
+
+SourceDetector rules (host contains):
+- indeed.com → source=indeed
+- greenhouse.io / boards.greenhouse.io → source=greenhouse
+- lever.co / jobs.lever.co → source=lever
+- workdayjobs.com / myworkdayjobs.com → source=workday
+- else if company TLD and path includes "/careers", "/jobs/" → source=company
+- default → unknown (still attempt generic extraction)
+
+-------------------------------------------------------------------------------
+
+## 8) Extraction — Field Heuristics (No-Guess)
+
+Primary data sources (in order of trust):
+1) JSON-LD schema.org JobPosting on page
+2) Visible DOM (labels near title/company/salary)
+3) Meta tags (`og:title`, `twitter:title`) if consistent with DOM
+
+8.1 JSON-LD JobPosting Parser
+- If script[type="application/ld+json"] includes JobPosting:
+  - title → jobTitle
+  - hiringOrganization.name → companyName
+  - jobLocationType: "TELECOMMUTE" → workMode=Remote
+  - jobLocation.address → city/state; ignore if not needed
+  - baseSalary.value.minValue/maxValue with currency "USD" → salaryRange
+- If any required field conflicts with visible H1/company label, prefer visible DOM.
+
+8.2 IndeedExtractor (selector candidates; robust to change)
+- Title candidates (pick longest non-empty text):
+  - h1[data-testid*="jobsearch-JobInfoHeader-title"]
+  - h1:has-text("job") near header
+- Company name candidates:
+  - div[data-company-name] a, div:has(span:has-text("Company")) a
+  - Link near title containing the company domain
+- Salary:
+  - Any text node containing "$" and "-" within job details panel; parse as annual if "year"/"yr"/"annual"
+- Work mode:
+  - Tokens: "Remote", "Hybrid", "On-site", "Onsite" (case-insensitive)
+- Level:
+  - Tokens: "Senior", "Staff", "Principal", "Lead", "L5", "L6", "IC", "Manager" (but avoid "Hiring Manager")
+- Description:
+  - main job content container; strip nav/ads
+
+8.3 Generic Company/ATS Extractor
+- Title:
+  - First H1 within main/section/article; fallback to `meta[property="og:title"]`
+- Company:
+  - If domain ≠ aggregator and contains company branding in header/footer; else take hiringOrganization from JSON-LD
+- Salary:
+  - Regex for $min–$max with optional commas; prefer annual; ignore hourly unless explicitly "hour"
+- Work mode:
+  - "Remote", "Hybrid", "On-site|Onsite"; if multiple present, choose the one in the summary header; else n/a
+- Level:
+  - Strict: accept only if token appears alongside title or in "About the role" heading
+
+8.4 Strict Contact Discovery (canonical domain only)
+- Only search pages on the canonicalUrl’s registrable domain (company or ATS).
+- On the JD page and at most 2 linked pages under same domain (Contact, Team, Recruiting):
+  - Hiring manager pattern: "(Hiring|Engineering|Product|Data) Manager|Director|Lead|Head of .*" adjacent to a person name (First Last)
+  - Recruiter pattern: "Recruiter|Talent Acquisition|TA" + person name
+  - Emails: mailto links or visible RFC 5322 emails; NO pattern guesses
+  - Phones: +1-###-###-####; normalize various US formats to that exact form
+- If not found, set hiringManager/email/phone to `n/a`.
+
+-------------------------------------------------------------------------------
+
+## 9) Canonical Company JD Finder (Algorithm)
+
+Given initial page P0:
+1) If P0 domain is company/ATS → canonicalUrl = P0 (unless content indicates aggregator embed)
+2) Otherwise, attempt:
+   - Follow visible "Apply", "Apply on company site", "Careers", or company-domain anchor with rel* hints
+   - If target matches known ATS patterns (Greenhouse/Lever/Workday), accept
+   - If target is company domain and includes "job" or "careers" segments, accept
+3) If multiple candidates:
+   - Prefer ATS deep link with matching title string similarity ≥ 0.75 to P0 title
+   - Else prefer same-domain page with H1 containing all title tokens
+4) BFS depth ≤ 2; never leave the company registrable domain once entered
+5) If none found in budget, canonicalUrl = null
+
+-------------------------------------------------------------------------------
+
+## 10) LLM (Semantic Kernel) — Prompts & Guardrails
+
+Model settings:
+- temperature=0.1, top_p=0.9, max_tokens=1200
+- JSON deterministic format; reject if keys missing
+
+Inputs:
+- visibleTitle, visibleCompany, visibleBody (plain text)
+- jsonld (if any), sourceType, canonicalUrl (if any)
+
+Tasks:
+A) Work mode classification
+  - Return "Remote"|"Hybrid"|"On-site" or "n/a" ONLY if an explicit literal is present in text. Quote the sentence snippet used for evidence.
+B) Job level classification
+  - Return a short token like "Senior","Staff","Principal","Lead","L5","Manager" or "n/a"; ONLY if explicit.
+C) Keywords extraction
+  - Return 10–25 high-signal terms present verbatim or as clear synonyms (e.g., "ASP.NET Core" ~ "ASP.NET"). Do not invent.
+
+Output JSON (example):
+    { "workMode":"Remote|Hybrid|On-site|n/a",
+      "jobLevel":"Senior|Staff|…|n/a",
+      "keywords":["...", "...", "..."],
+      "evidence":{"workMode":"<short quote>", "jobLevel":"<short quote>"} }
+
+If evidence is absent → set field to "n/a".
+
+-------------------------------------------------------------------------------
+
+## 11) Formatting Rules — Excel Row & Keywords
+
+Sanitization (before composing):
+- Collapse internal whitespace to single spaces.
+- Remove tabs/newlines from every field (they break the single line).
+- Dates: format as MM/DD/YYYY in timezone.
+- Salary: "$168,000 – $240,000" → "168000–240000"
+- hiringManager: "First Last — Title" (em dash) if both are present; else `n/a`
+
+Composer (EXACT order from §1.2):
+- Join 20 fields with real tab chars (U+0009).
+- Never emit headers. Always emit 19 tabs (to ensure 20 columns).
+- Example (conceptual; not literal tabs here): company[TAB]title[TAB]url[…19 tabs total…]
+
+Keywords block:
+- Join array with '\n' (LF). No trailing newline at end.
+
+-------------------------------------------------------------------------------
+
+## 12) Database Schema (PostgreSQL DDL)
+
+Tables (minimum viable, single-owner)
+
+    -- Raw page artifacts for audit
+    CREATE TABLE audit_artifact (
+      id UUID PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      source_url TEXT NOT NULL,
+      canonical_url TEXT,
+      html_path TEXT NOT NULL,
+      screenshot_path TEXT NOT NULL,
+      detector TEXT NOT NULL
+    );
+
+    -- Parsed facts (normalized), one row per extract
+    CREATE TABLE extraction_result (
+      id UUID PRIMARY KEY,
+      artifact_id UUID NOT NULL REFERENCES audit_artifact(id) ON DELETE CASCADE,
+      company_name TEXT NOT NULL,
+      job_title TEXT NOT NULL,
+      job_source_url TEXT NOT NULL,
+      hiring_manager TEXT,
+      phone TEXT,
+      email TEXT,
+      stage TEXT NOT NULL, -- Seen|Applied|...
+      next_action_date DATE NOT NULL,
+      next_action_note TEXT NOT NULL,
+      last_updated DATE NOT NULL,
+      interview_direction TEXT,
+      interview_tags TEXT,
+      salary_range INT8RANGE, -- use int8 to be safe, or int4range if preferred
+      work_mode TEXT,
+      job_level TEXT,
+      application_files TEXT,
+      version INT NOT NULL,
+      created_at DATE NOT NULL,
+      company_career_url TEXT,
+      data_confidence TEXT NOT NULL  -- High|Medium|Low
+    );
+
+Indexes:
+- CREATE INDEX ON audit_artifact (created_at DESC);
+- CREATE INDEX ON extraction_result (company_name, job_title);
+- CREATE INDEX ON extraction_result USING GIST (salary_range);
+
+-------------------------------------------------------------------------------
+
+## 13) Frontend — Next.js 15 UI Spec
+
+Screen: “Single URL Canonicalizer”
+- Components:
+  - URL input (required), timezone select (default America/Los_Angeles), submit button
+  - Result panel:
+    - Code-style box with single-line tab-delimited row
+    - Second box with vertical keywords
+    - Copy buttons (use Clipboard API)
+    - Audit link: /audit/{auditId}
+- Error states:
+  - If FETCH_FAILED → show “Paste visible contents” textarea; POST as htmlFallback
+  - If PARSE_FAILED → show inspector with screenshot/HTML links
+
+Accessibility:
+- Disable submit while in-flight; show progress; announce errors via ARIA live region.
+
+-------------------------------------------------------------------------------
+
+## 14) Audit Viewer — /audit/[id]
+
+Displays:
+- Source URL, Canonical URL, Detector, CreatedAt
+- Screenshot image (fit to width)
+- Download/View raw HTML
+
+Security (personal mode):
+- No auth; hidden route (not indexed). Optionally require shared secret header when deployed publicly.
+
+-------------------------------------------------------------------------------
+
+## 15) Error Handling & Edge Cases
+
+- Unsupported/blocked pages:
+  - Return FETCH_FAILED with guidance to paste htmlFallback
+- Multiple candidate canonicals:
+  - Choose highest title similarity; otherwise prefer ATS domain; else set canonicalUrl=null (Medium confidence)
+- Salary strings with hourly rates:
+  - If "hour" or "/hr" present → ignore (set n/a) for v0.1 to avoid mis-scaling
+- International currency:
+  - If not USD $ explicitly → set salaryRange n/a
+
+-------------------------------------------------------------------------------
+
+## 16) Idempotency, Concurrency, Performance
+
+- Single-user, per-request idempotency via send-hash not required yet.
+- Limit to 1 browser context at a time initially; configurable later.
+- Enforce 25s request budget; advise fallback paste if exceeded.
+
+-------------------------------------------------------------------------------
+
+## 17) Test Plan — Unit / Integration / E2E (concrete)
+
+Unit
+- UrlNormalizer: strips UTM, preserves ATS query
+- SalaryParser: "$168,000 – $240,000" → 168000–240000; hourly ignored
+- WorkModeClassifier: explicit literals only; ambiguous → n/a
+- LevelClassifier: "Senior", "Staff", "L5" detected only when explicit
+- Phone/Email normalizers: canonical forms, RFC 5322 compliance check
+
+Integration
+- IndeedExtractor on 3 recorded fixtures (stored HTML):
+  - Title/company populated; salary present only when explicit; work mode from header chips
+- JsonLd parser on 3 ATS fixtures (Greenhouse/Lever/Workday)
+- CanonicalFinder resolves from aggregator to ATS/company in ≥ 4/5 cases
+
+E2E
+- POST /extract with a valid Indeed URL:
+  - Produces a 20-field tab-delimited single line (verify exactly 19 tabs)
+  - nextActionDate = today+7 in TZ; lastUpdated/createdAt = today
+  - keywords 10–25 items; no invented tech
+- Blocked page path:
+  - Returns FETCH_FAILED; retry with htmlFallback produces valid outputs
+
+Manual checklist
+- Paste 5 diverse URLs (aggregator and ATS)
+- Copy row to Excel: each field lands in correct column; no wrap
+- Open audit viewer: screenshot and HTML match extracted values
+
+-------------------------------------------------------------------------------
+
+## 18) Implementation Cards (buildable mini-scopes)
+
+[API-001] Wire POST /extract
+- Build: Controller, model validation, correlationId propagation
+- Test: 400 BAD_URL on malformed URL; 200 baseline
+
+[CRAWL-001] Playwright bootstrap
+- Build: Singleton browser; per-request context; HTML/PNG save
+- Test: Known page fetch; files exist
+
+[DETECT-001] SourceDetector
+- Build: hostname/regex mapping (indeed|greenhouse|lever|workday|company)
+- Test: Table-driven tests
+
+[PARSE-001] JsonLdJobPostingParser
+- Build: schema.org JobPosting parse with safe fallbacks
+- Test: Fixtures cover title/company/salary
+
+[PARSE-002] IndeedExtractor
+- Build: Title/company/salary/mode/level via resilient selector candidates
+- Test: 3 fixtures pass; where absent → n/a
+
+[CANON-001] CanonicalFinder
+- Build: Follow "Apply"/"Careers" anchors; ATS patterns; title similarity
+- Test: 5 cases; ≥4 resolved
+
+[CONTACT-001] ContactFinder (strict)
+- Build: Same-domain search; name+title; mailto; +1 phone normalization
+- Test: Positive/negative fixtures
+
+[LLM-001] SK Classifier
+- Build: Prompts+schema; temp=0.1; evidence gates
+- Test: Ambiguity → n/a; explicit → correct
+
+[FORMAT-001] Row/Keywords Composer
+- Build: Sanitizers; 20-field join; keywords join
+- Test: Excel paste sanity (19 tabs)
+
+[UI-001] Minimal UI
+- Build: Form; results; copy buttons; audit link
+- Test: 3 URL runs
+
+[AUDIT-001] Audit Viewer
+- Build: GET /audit/{id}; show html/screenshot
+- Test: Visual check
+
+-------------------------------------------------------------------------------
+
+## 19) Runbook — Local Dev & Deploy
+
+Local
+- Prereqs: Node 20+, .NET 8+, PostgreSQL 14+, pnpm, Playwright browsers installed
+- Steps:
+  1) Create DB and set DB_CONN
+  2) Install Playwright deps: run playwright install
+  3) Start API: dotnet run -p apps/api
+  4) Start FE: pnpm dev --filter @apps/frontend
+  5) Optional Workers: wrangler dev (proxy to API_ORIGIN)
+
+Staging Deploy
+- Set API_ORIGIN in Workers vars
+- Publish Workers: wrangler deploy
+- Publish API (container or VM)
+- Verify /api/health, then /extract
+
+-------------------------------------------------------------------------------
+
+## 20) Acceptance (Definition of Done)
+
+- From a clean deploy, pasting a valid Indeed URL returns:
+  - Single-line row (20 columns, unknowns as `n/a`, dates MM/DD/YYYY with nextActionDate=today+7)
+  - Keywords block (10–25 lines)
+  - auditId resolvable; screenshot/HTML align with extracted values
+- No invented data. Salary only when explicit $min–$max. Contacts only when explicitly present on official domain.
+- Canonical finder prefers company/ATS and overrides aggregator fields when found.
+
+-------------------------------------------------------------------------------
+
+## 21) Roadmap (next increments, tiny)
+
+- Add Source B extractor (your most common ATS)
+- Add batch queue (Hangfire) for paste-many
+- Add CSV export of rows
+- Add Google adapters (Gmail/Sheets/Calendar) behind flags later
+
+-------------------------------------------------------------------------------
+
+## 22) Operator UX Notes (Personal Mode)
+- If network blocks a page, use the “Paste visible contents” fallback. The system will parse the pasted HTML/text with the same rules and still return the two artifacts.
+- Always review the audit screenshot before trusting salary/contact fields.
 
