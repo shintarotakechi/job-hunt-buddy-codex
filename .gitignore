@@ -1,0 +1,23 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Next.js build output
+.next/
+out/
+
+# Environment files
+.env*
+!.env.example
+
+# Local tooling
+.vercel/
+.idea/
+.DS_Store
+
+# Repo-specific ignores
+test.txt
+AGENTS.md
